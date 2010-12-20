@@ -18,6 +18,10 @@
 #include <linux/bitmap.h>
 #include <linux/rbtree.h>
 
+#if defined(CONFIG_I2C) || (defined(CONFIG_I2C_MODULE) && defined(MODULE))
+#define HAVE_I2C_OPS
+#endif
+
 static int do_hw_write(struct snd_soc_codec *codec, unsigned int reg,
 		       unsigned int value, void *data, unsigned int size)
 {
@@ -83,6 +87,36 @@ static int do_spi_write(struct spi_device *spi, u8 *msg, int len)
 	spi_sync(spi, &m);
 
 	return len;
+}
+#endif
+
+#ifdef HAVE_I2C_OPS
+static unsigned int do_i2c_read(struct snd_soc_codec *codec,
+				int reglen, void *regp,
+				int datalen, void *datap)
+{
+	struct i2c_msg xfer[2];
+	int ret;
+	struct i2c_client *client = codec->control_data;
+
+	/* Write register */
+	xfer[0].addr = client->addr;
+	xfer[0].flags = 0;
+	xfer[0].len = reglen;
+	xfer[0].buf = regp;
+
+	/* Read data */
+	xfer[1].addr = client->addr;
+	xfer[1].flags = I2C_M_RD;
+	xfer[1].len = datalen;
+	xfer[1].buf = datap;
+
+	ret = i2c_transfer(client->adapter, xfer, 2);
+	if (ret != 2) {
+		dev_err(&client->dev, "i2c_transfer() returned %d\n", ret);
+		return -EIO;
+	}
+	return 0;
 }
 #endif
 
@@ -230,103 +264,46 @@ static int snd_soc_8_16_spi_write(void *control_data, const char *data,
 #define snd_soc_8_16_spi_write NULL
 #endif
 
-#if defined(CONFIG_I2C) || (defined(CONFIG_I2C_MODULE) && defined(MODULE))
+#ifdef HAVE_I2C_OPS
 static unsigned int snd_soc_8_8_read_i2c(struct snd_soc_codec *codec,
 					  unsigned int r)
 {
-	struct i2c_msg xfer[2];
 	u8 reg = r;
 	u8 data;
-	int ret;
-	struct i2c_client *client = codec->control_data;
 
-	/* Write register */
-	xfer[0].addr = client->addr;
-	xfer[0].flags = 0;
-	xfer[0].len = 1;
-	xfer[0].buf = &reg;
-
-	/* Read data */
-	xfer[1].addr = client->addr;
-	xfer[1].flags = I2C_M_RD;
-	xfer[1].len = 1;
-	xfer[1].buf = &data;
-
-	ret = i2c_transfer(client->adapter, xfer, 2);
-	if (ret != 2) {
-		dev_err(&client->dev, "i2c_transfer() returned %d\n", ret);
+	if (do_i2c_read(codec, 1, &reg, 1, &data))
 		return 0;
-	}
-
 	return data;
 }
 #else
 #define snd_soc_8_8_read_i2c NULL
 #endif
 
-#if defined(CONFIG_I2C) || (defined(CONFIG_I2C_MODULE) && defined(MODULE))
+#ifdef HAVE_I2C_OPS
 static unsigned int snd_soc_8_16_read_i2c(struct snd_soc_codec *codec,
 					  unsigned int r)
 {
-	struct i2c_msg xfer[2];
 	u8 reg = r;
 	u16 data;
-	int ret;
-	struct i2c_client *client = codec->control_data;
 
-	/* Write register */
-	xfer[0].addr = client->addr;
-	xfer[0].flags = 0;
-	xfer[0].len = 1;
-	xfer[0].buf = &reg;
-
-	/* Read data */
-	xfer[1].addr = client->addr;
-	xfer[1].flags = I2C_M_RD;
-	xfer[1].len = 2;
-	xfer[1].buf = (u8 *)&data;
-
-	ret = i2c_transfer(client->adapter, xfer, 2);
-	if (ret != 2) {
-		dev_err(&client->dev, "i2c_transfer() returned %d\n", ret);
+	if (do_i2c_read(codec, 1, &reg, 2, &data))
 		return 0;
-	}
-
 	return (data >> 8) | ((data & 0xff) << 8);
 }
 #else
 #define snd_soc_8_16_read_i2c NULL
 #endif
 
-#if defined(CONFIG_I2C) || (defined(CONFIG_I2C_MODULE) && defined(MODULE))
+#ifdef HAVE_I2C_OPS
 static unsigned int snd_soc_16_8_read_i2c(struct snd_soc_codec *codec,
 					  unsigned int r)
 {
-	struct i2c_msg xfer[2];
 	u16 reg = r;
 	u8 data;
-	int ret;
-	struct i2c_client *client = codec->control_data;
 
-	/* Write register */
-	xfer[0].addr = client->addr;
-	xfer[0].flags = 0;
-	xfer[0].len = 2;
-	xfer[0].buf = (u8 *)&reg;
-
-	/* Read data */
-	xfer[1].addr = client->addr;
-	xfer[1].flags = I2C_M_RD;
-	xfer[1].len = 1;
-	xfer[1].buf = &data;
-
-	ret = i2c_transfer(client->adapter, xfer, 2);
-	if (ret != 2) {
-		dev_err(&client->dev, "i2c_transfer() returned %d\n", ret);
+	if (do_i2c_read(codec, 2, &reg, 1, &data))
 		return 0;
-	}
-
-	return data;
+	return (data >> 8) | ((data & 0xff) << 8);
 }
 #else
 #define snd_soc_16_8_read_i2c NULL
@@ -371,34 +348,15 @@ static int snd_soc_16_8_spi_write(void *control_data, const char *data,
 #define snd_soc_16_8_spi_write NULL
 #endif
 
-#if defined(CONFIG_I2C) || (defined(CONFIG_I2C_MODULE) && defined(MODULE))
+#ifdef HAVE_I2C_OPS
 static unsigned int snd_soc_16_16_read_i2c(struct snd_soc_codec *codec,
 					   unsigned int r)
 {
-	struct i2c_msg xfer[2];
 	u16 reg = cpu_to_be16(r);
 	u16 data;
-	int ret;
-	struct i2c_client *client = codec->control_data;
 
-	/* Write register */
-	xfer[0].addr = client->addr;
-	xfer[0].flags = 0;
-	xfer[0].len = 2;
-	xfer[0].buf = (u8 *)&reg;
-
-	/* Read data */
-	xfer[1].addr = client->addr;
-	xfer[1].flags = I2C_M_RD;
-	xfer[1].len = 2;
-	xfer[1].buf = (u8 *)&data;
-
-	ret = i2c_transfer(client->adapter, xfer, 2);
-	if (ret != 2) {
-		dev_err(&client->dev, "i2c_transfer() returned %d\n", ret);
+	if (do_i2c_read(codec, 2, &reg, 2, &data))
 		return 0;
-	}
-
 	return be16_to_cpu(data);
 }
 #else
@@ -533,7 +491,7 @@ int snd_soc_codec_set_cache_io(struct snd_soc_codec *codec,
 		break;
 
 	case SND_SOC_I2C:
-#if defined(CONFIG_I2C) || (defined(CONFIG_I2C_MODULE) && defined(MODULE))
+#ifdef HAVE_I2C_OPS
 		codec->hw_write = (hw_write_t)i2c_master_send;
 #endif
 		if (io_types[i].i2c_read)
