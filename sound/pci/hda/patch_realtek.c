@@ -28,6 +28,7 @@
 #include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/module.h>
+#include <linux/bitops.h>
 #include <sound/core.h>
 #include <sound/jack.h>
 #include "hda_codec.h"
@@ -2924,201 +2925,214 @@ static int alc_auto_select_dac(struct hda_codec *codec, hda_nid_t pin,
 	return 0;
 }
 
-/* look for an empty DAC slot */
-static hda_nid_t alc_auto_look_for_dac(struct hda_codec *codec, hda_nid_t pin)
-{
-	struct alc_spec *spec = codec->spec;
-	hda_nid_t srcs[5];
-	int i, num;
+#define MAX_PINS	16
+#define MAX_DACS	8
 
+#define PIN_MAP_TYPE_MASK	0x10
+#define PIN_MAP_OFS_MASK	0x0f
+
+enum {
+	PIN_MAP_LO = 0,
+	PIN_MAP_HP = 0x10,
+	PIN_MAP_SPK = 0x20,
+	PIN_MAP_MIO = 0x30,
+};
+
+struct alc_dac_map {
+	unsigned int num_pins;
+	hda_nid_t pins[MAX_PINS];
+	unsigned char ids[MAX_PINS];
+	unsigned long accessible_dacs[MAX_PINS];
+	unsigned int num_dacs;
+	hda_nid_t dacs[MAX_DACS];
+	unsigned long dac_maps[MAX_DACS];
+	unsigned long dacs_set;
+	hda_nid_t assigned_dacs[MAX_PINS];
+};
+
+static int alc_auto_fill_multi_ios(struct hda_codec *codec,
+				   struct alc_dac_map *rec,
+				   unsigned int location);
+static hda_nid_t alc_look_for_out_vol_nid(struct hda_codec *codec,
+					  hda_nid_t pin, hda_nid_t dac);
+
+static void alc_auto_map_pin(struct hda_codec *codec, struct alc_dac_map *rec,
+			     int type, hda_nid_t pin)
+{
+	hda_nid_t srcs[5];
+	int i, num, idx, found;
+
+	if (snd_BUG_ON(rec->num_pins >= MAX_PINS))
+		return;
+
+	found = 0;
 	pin = alc_go_down_to_selector(codec, pin);
 	num = snd_hda_get_connections(codec, pin, srcs, ARRAY_SIZE(srcs));
 	for (i = 0; i < num; i++) {
 		hda_nid_t nid = alc_auto_mix_to_dac(codec, srcs[i]);
 		if (!nid)
 			continue;
-		if (found_in_nid_list(nid, spec->multiout.dac_nids,
-				      ARRAY_SIZE(spec->private_dac_nids)))
-			continue;
-		if (found_in_nid_list(nid, spec->multiout.hp_out_nid,
-				      ARRAY_SIZE(spec->multiout.hp_out_nid)))
-		    continue;
-		if (found_in_nid_list(nid, spec->multiout.extra_out_nid,
-				      ARRAY_SIZE(spec->multiout.extra_out_nid)))
-		    continue;
-		return nid;
+		idx = find_idx_in_nid_list(nid, rec->dacs, rec->num_dacs);
+		if (idx >= 0) {
+			set_bit(rec->num_pins, &rec->dac_maps[idx]);
+			set_bit(idx, &rec->accessible_dacs[rec->num_pins]);
+			found = 1;
+		}
 	}
-	return 0;
-}
-
-/* check whether the DAC is reachable from the pin */
-static bool alc_auto_is_dac_reachable(struct hda_codec *codec,
-				      hda_nid_t pin, hda_nid_t dac)
-{
-	hda_nid_t srcs[5];
-	int i, num;
-
-	pin = alc_go_down_to_selector(codec, pin);
-	num = snd_hda_get_connections(codec, pin, srcs, ARRAY_SIZE(srcs));
-	for (i = 0; i < num; i++) {
-		hda_nid_t nid = alc_auto_mix_to_dac(codec, srcs[i]);
-		if (nid == dac)
-			return true;
+	if (found) {
+		rec->pins[rec->num_pins] = pin;
+		rec->num_pins++;
 	}
-	return false;
 }
 
-static hda_nid_t get_dac_if_single(struct hda_codec *codec, hda_nid_t pin)
-{
-	hda_nid_t sel = alc_go_down_to_selector(codec, pin);
-	if (snd_hda_get_conn_list(codec, sel, NULL) == 1)
-		return alc_auto_look_for_dac(codec, pin);
-	return 0;
-}
-
-/* return 0 if no possible DAC is found, 1 if one or more found */
-static int alc_auto_fill_extra_dacs(struct hda_codec *codec, int num_outs,
-				    const hda_nid_t *pins, hda_nid_t *dacs)
+static void alc_auto_map_pins(struct hda_codec *codec, struct alc_dac_map *rec,
+			      int type, int num_pins, const hda_nid_t *pins)
 {
 	int i;
-
-	if (num_outs && !dacs[0]) {
-		dacs[0] = alc_auto_look_for_dac(codec, pins[0]);
-		if (!dacs[0])
-			return 0;
+	for (i = 0; i < num_pins; i++) {
+		if (!pins[i])
+			break;
+		alc_auto_map_pin(codec, rec, type | i, pins[i]);
 	}
-
-	for (i = 1; i < num_outs; i++)
-		dacs[i] = get_dac_if_single(codec, pins[i]);
-	for (i = 1; i < num_outs; i++) {
-		if (!dacs[i])
-			dacs[i] = alc_auto_look_for_dac(codec, pins[i]);
-	}
-	return 1;
 }
 
-static int alc_auto_fill_multi_ios(struct hda_codec *codec,
-				   unsigned int location, int offset);
-static hda_nid_t alc_look_for_out_vol_nid(struct hda_codec *codec,
-					  hda_nid_t pin, hda_nid_t dac);
+static int squash_nid_list(hda_nid_t *nids, int num_nids)
+{
+	int i, nums = 0;
+	for (i = 0; i < num_nids; i++) {
+		if (nids[i])
+			nums++;
+		else {
+			memmove(nids + i, nids + i + 1,
+				sizeof(hda_nid_t) * (num_nids - i - 1));
+			nids[num_nids - 1] = 0;
+		}
+	}
+	return nums;
+}
 
 /* fill in the dac_nids table from the parsed pin configuration */
 static int alc_auto_fill_dac_nids(struct hda_codec *codec)
 {
 	struct alc_spec *spec = codec->spec;
 	struct auto_pin_cfg *cfg = &spec->autocfg;
-	unsigned int location, defcfg;
-	int num_pins;
-	bool redone = false;
+	struct alc_dac_map maprec, *rec = &maprec;
+	hda_nid_t nid;
 	int i;
 
- again:
-	/* set num_dacs once to full for alc_auto_look_for_dac() */
-	spec->multiout.num_dacs = cfg->line_outs;
-	spec->multiout.hp_out_nid[0] = 0;
-	spec->multiout.extra_out_nid[0] = 0;
-	memset(spec->private_dac_nids, 0, sizeof(spec->private_dac_nids));
 	spec->multiout.dac_nids = spec->private_dac_nids;
-	spec->multi_ios = 0;
+	memset(rec, 0, sizeof(*rec));
 
-	/* fill hard-wired DACs first */
-	if (!redone) {
-		for (i = 0; i < cfg->line_outs; i++)
-			spec->private_dac_nids[i] =
-				get_dac_if_single(codec, cfg->line_out_pins[i]);
-		if (cfg->hp_outs)
-			spec->multiout.hp_out_nid[0] =
-				get_dac_if_single(codec, cfg->hp_pins[0]);
-		if (cfg->speaker_outs)
-			spec->multiout.extra_out_nid[0] =
-				get_dac_if_single(codec, cfg->speaker_pins[0]);
+	/* find all available DACs */
+	nid = codec->start_nid;
+	for (i = 0; i < codec->num_nodes; i++, nid++) {
+		unsigned int caps = get_wcaps(codec, nid);
+		int type = get_wcaps_type(caps);
+		if (type != AC_WID_AUD_OUT || (caps & AC_WCAP_DIGITAL))
+			continue;
+		if (snd_BUG_ON(rec->num_dacs >= MAX_DACS))
+			break;
+		rec->dacs[rec->num_dacs++] = nid;
 	}
 
-	for (i = 0; i < cfg->line_outs; i++) {
-		hda_nid_t pin = cfg->line_out_pins[i];
-		if (spec->private_dac_nids[i])
-			continue;
-		spec->private_dac_nids[i] = alc_auto_look_for_dac(codec, pin);
-		if (!spec->private_dac_nids[i] && !redone) {
-			/* if we can't find primary DACs, re-probe without
-			 * checking the hard-wired DACs
-			 */
-			redone = true;
-			goto again;
+	alc_auto_map_pins(codec, rec, PIN_MAP_LO,
+			  cfg->line_outs, cfg->line_out_pins);
+	alc_auto_map_pins(codec, rec, PIN_MAP_HP,
+			  cfg->hp_outs, cfg->hp_pins);
+	alc_auto_map_pins(codec, rec, PIN_MAP_SPK,
+			  cfg->speaker_outs, cfg->speaker_pins);
+	if (cfg->line_outs == 1 && cfg->line_out_type != AUTO_PIN_SPEAKER_OUT) {
+		/* try to fill multi-io */
+		unsigned int location, defcfg;
+		defcfg = snd_hda_codec_get_pincfg(codec, cfg->line_out_pins[0]);
+		location = get_defcfg_location(defcfg);
+		alc_auto_fill_multi_ios(codec, rec, location);
+	}
+
+	/* Pin-assignment strategy:
+	 * - when a DAC is mapped to a single pin, take it.
+	 * - when a DAC is mapped to multiple pins, look for the DAC with
+	 *   the least number of pins, and assign to the pin with the highest
+	 *   priority (i.e. the lowest id number)
+	 */
+	for (;;) {
+		int found = 0, dac_idx = 0, pin_idx;
+		for (i = 0; i < rec->num_dacs; i++) {
+			int w;
+			if (test_bit(i, &rec->dacs_set))
+				continue;
+			w = hweight_long(rec->dac_maps[i]);
+			if (!w)
+				continue;
+			if (!found || w < found) {
+				found = w;
+				dac_idx = i;
+				if (w == 1)
+					break;
+			}
 		}
+		if (!found)
+			break;
+		pin_idx = find_first_bit(&rec->dac_maps[dac_idx],
+					 rec->num_dacs) - 1;
+		rec->assigned_dacs[pin_idx] = rec->dacs[dac_idx];
+		for (i = 0; i < rec->num_dacs; i++)
+			clear_bit(pin_idx, &rec->dac_maps[i]);
+		set_bit(dac_idx, &rec->dacs_set);
+	}
+
+	/* remap LO, HP and SPK outs */
+	for (i = 0; i < rec->num_pins; i++) {
+		hda_nid_t dac = rec->assigned_dacs[i];
+		hda_nid_t *list;
+		if (!dac) {
+			/* try to map to an accessible DAC */
+			int dac_idx;
+			if (!rec->accessible_dacs[i])
+				continue;
+			dac_idx = find_first_bit(&rec->accessible_dacs[i],
+						 rec->num_dacs) - 1;
+			dac = rec->assigned_dacs[i] = rec->dacs[dac_idx];
+		}
+		switch (rec->ids[i] & PIN_MAP_TYPE_MASK) {
+		case PIN_MAP_LO:
+			list = spec->private_dac_nids;
+			break;
+		case PIN_MAP_HP:
+			list = spec->multiout.hp_out_nid;
+			break;
+		case PIN_MAP_SPK:
+			list = spec->multiout.extra_out_nid;
+			break;
+		default:
+			continue;
+		}
+		list[rec->ids[i] & PIN_MAP_OFS_MASK] = dac;
 	}
 
 	/* re-count num_dacs and squash invalid entries */
-	spec->multiout.num_dacs = 0;
-	for (i = 0; i < cfg->line_outs; i++) {
-		if (spec->private_dac_nids[i])
-			spec->multiout.num_dacs++;
-		else {
-			memmove(spec->private_dac_nids + i,
-				spec->private_dac_nids + i + 1,
-				sizeof(hda_nid_t) * (cfg->line_outs - i - 1));
-			spec->private_dac_nids[cfg->line_outs - 1] = 0;
-		}
+	spec->multiout.num_dacs =
+		squash_nid_list(spec->private_dac_nids,
+				ARRAY_SIZE(spec->private_dac_nids));
+	squash_nid_list(spec->multiout.hp_out_nid,
+			ARRAY_SIZE(spec->multiout.hp_out_nid));
+	squash_nid_list(spec->multiout.extra_out_nid,
+			ARRAY_SIZE(spec->multiout.extra_out_nid));
+
+	/* remap multi-ios */
+	for (i = 0; i < rec->num_pins; i++) {
+		hda_nid_t dac = rec->assigned_dacs[i];
+		if (!dac)
+			continue;
+		if ((rec->ids[i] & PIN_MAP_TYPE_MASK) != PIN_MAP_MIO)
+			continue;
+		spec->multi_io[spec->multi_ios].pin = rec->pins[i];
+		spec->multi_io[spec->multi_ios].dac = dac;
+		spec->multi_ios++;
+		if (spec->multi_ios >= ARRAY_SIZE(spec->multi_io))
+			break;
 	}
 
-	if (cfg->line_outs == 1 && cfg->line_out_type != AUTO_PIN_SPEAKER_OUT) {
-		/* try to fill multi-io first */
-		defcfg = snd_hda_codec_get_pincfg(codec, cfg->line_out_pins[0]);
-		location = get_defcfg_location(defcfg);
-
-		num_pins = alc_auto_fill_multi_ios(codec, location, 0);
-		if (num_pins > 0) {
-			spec->multi_ios = num_pins;
-			spec->ext_channel_count = 2;
-			spec->multiout.num_dacs = num_pins + 1;
-		}
-	}
-
-	if (cfg->line_out_type != AUTO_PIN_HP_OUT)
-		alc_auto_fill_extra_dacs(codec, cfg->hp_outs, cfg->hp_pins,
-				 spec->multiout.hp_out_nid);
-	if (cfg->line_out_type != AUTO_PIN_SPEAKER_OUT) {
-		int err = alc_auto_fill_extra_dacs(codec, cfg->speaker_outs,
-					cfg->speaker_pins,
-					spec->multiout.extra_out_nid);
-		/* if no speaker volume is assigned, try again as the primary
-		 * output
-		 */
-		if (!err && cfg->speaker_outs > 0 &&
-		    cfg->line_out_type == AUTO_PIN_HP_OUT) {
-			cfg->hp_outs = cfg->line_outs;
-			memcpy(cfg->hp_pins, cfg->line_out_pins,
-			       sizeof(cfg->hp_pins));
-			cfg->line_outs = cfg->speaker_outs;
-			memcpy(cfg->line_out_pins, cfg->speaker_pins,
-			       sizeof(cfg->speaker_pins));
-			cfg->speaker_outs = 0;
-			memset(cfg->speaker_pins, 0, sizeof(cfg->speaker_pins));
-			cfg->line_out_type = AUTO_PIN_SPEAKER_OUT;
-			redone = false;
-			goto again;
-		}
-	}
-
-	if (!spec->multi_ios &&
-	    cfg->line_out_type == AUTO_PIN_SPEAKER_OUT &&
-	    cfg->hp_outs) {
-		/* try multi-ios with HP + inputs */
-		defcfg = snd_hda_codec_get_pincfg(codec, cfg->hp_pins[0]);
-		location = get_defcfg_location(defcfg);
-
-		num_pins = alc_auto_fill_multi_ios(codec, location, 1);
-		if (num_pins > 0) {
-			spec->multi_ios = num_pins;
-			spec->ext_channel_count = 2;
-			spec->multiout.num_dacs = num_pins + 1;
-		}
-	}
-
-	if (cfg->line_out_pins[0])
-		spec->vmaster_nid =
-			alc_look_for_out_vol_nid(codec, cfg->line_out_pins[0],
-						 spec->multiout.dac_nids[0]);
 	return 0;
 }
 
@@ -3523,19 +3537,16 @@ static void alc_auto_init_extra_out(struct hda_codec *codec)
  * multi-io helper
  */
 static int alc_auto_fill_multi_ios(struct hda_codec *codec,
-				   unsigned int location,
-				   int offset)
+				   struct alc_dac_map *rec,
+				   unsigned int location)
 {
 	struct alc_spec *spec = codec->spec;
 	struct auto_pin_cfg *cfg = &spec->autocfg;
-	hda_nid_t prime_dac = spec->private_dac_nids[0];
-	int type, i, dacs, num_pins = 0;
+	int type, i;
 
-	dacs = spec->multiout.num_dacs;
 	for (type = AUTO_PIN_LINE_IN; type >= AUTO_PIN_MIC; type--) {
 		for (i = 0; i < cfg->num_inputs; i++) {
 			hda_nid_t nid = cfg->inputs[i].pin;
-			hda_nid_t dac = 0;
 			unsigned int defcfg, caps;
 			if (cfg->inputs[i].type != type)
 				continue;
@@ -3547,30 +3558,10 @@ static int alc_auto_fill_multi_ios(struct hda_codec *codec,
 			caps = snd_hda_query_pin_caps(codec, nid);
 			if (!(caps & AC_PINCAP_OUT))
 				continue;
-			if (offset && offset + num_pins < dacs) {
-				dac = spec->private_dac_nids[offset + num_pins];
-				if (!alc_auto_is_dac_reachable(codec, nid, dac))
-					dac = 0;
-			}
-			if (!dac)
-				dac = alc_auto_look_for_dac(codec, nid);
-			if (!dac)
-				continue;
-			spec->multi_io[num_pins].pin = nid;
-			spec->multi_io[num_pins].dac = dac;
-			num_pins++;
-			spec->private_dac_nids[spec->multiout.num_dacs++] = dac;
+			alc_auto_map_pin(codec, rec, PIN_MAP_MIO, nid);
 		}
 	}
-	spec->multiout.num_dacs = dacs;
-	if (num_pins < 2) {
-		/* clear up again */
-		memset(spec->private_dac_nids + dacs, 0,
-		       sizeof(hda_nid_t) * (AUTO_CFG_MAX_OUTS - dacs));
-		spec->private_dac_nids[0] = prime_dac;
-		return 0;
-	}
-	return num_pins;
+	return 0;
 }
 
 static int alc_auto_ch_mode_info(struct snd_kcontrol *kcontrol,
